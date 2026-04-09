@@ -5,6 +5,7 @@ Supports text + voice notes (transcribed via Groq Whisper) + images + PDFs
 """
 import asyncio
 import base64
+import datetime
 import logging
 import mimetypes
 import os
@@ -24,6 +25,7 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+import pytz
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -33,11 +35,27 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-BOT_TOKEN      = os.environ["TELEGRAM_BOT_TOKEN"]
-AGENT_ID       = os.environ["AGENT_ID"]
-ENVIRONMENT_ID = os.environ["ENVIRONMENT_ID"]
-VAULT_REPO     = os.environ.get("VAULT_GITHUB_REPO", "")
+BOT_TOKEN       = os.environ["TELEGRAM_BOT_TOKEN"]
+AGENT_ID        = os.environ["AGENT_ID"]
+ENVIRONMENT_ID  = os.environ["ENVIRONMENT_ID"]
+VAULT_REPO      = os.environ.get("VAULT_GITHUB_REPO", "")
 ALLOWED_USER_ID = os.environ.get("ALLOWED_TELEGRAM_USER_ID", "")
+
+BRIEF_PROMPT = (
+    "Generate a CEO brief for me. "
+    "Clone the vault first (git clone $VAULT_GITHUB_REPO /tmp/vault), then read:\n"
+    "- raw/data/hablum-pipeline.csv — pipeline status\n"
+    "- wiki/projects/hablum.md — Hablum overview\n"
+    "- wiki/projects/matter-mos.md — Matter Mos overview\n"
+    "- wiki/projects/kaum.md — KAUM overview\n"
+    "- wiki/projects/cortexin.md — Cortexin overview\n\n"
+    "Format the brief like this:\n"
+    "🔴🟡🟢 status per project (one line each)\n"
+    "📋 Pipeline snapshot — who responded, who needs follow-up\n"
+    "⚡ Top 3 things I should do today\n"
+    "🚧 What's blocked and needs a decision\n\n"
+    "Be direct. No fluff. Telegram format — short lines, no walls of text."
+)
 
 client = Anthropic()
 groq   = Groq(api_key=os.environ["GROQ_API_KEY"])
@@ -372,22 +390,70 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
-    brief_prompt = (
-        "Generate a CEO brief for me. "
-        "Clone the vault first (git clone $VAULT_GITHUB_REPO /tmp/vault), then read:\n"
-        "- raw/data/hablum-pipeline.csv — pipeline status\n"
-        "- wiki/projects/hablum.md — Hablum overview\n"
-        "- wiki/projects/matter-mos.md — Matter Mos overview\n"
-        "- wiki/projects/kaum.md — KAUM overview\n"
-        "- wiki/projects/cortexin.md — Cortexin overview\n\n"
-        "Format the brief like this:\n"
-        "🔴🟡🟢 status per project (one line each)\n"
-        "📋 Pipeline snapshot — who responded, who needs follow-up\n"
-        "⚡ Top 3 things I should do today\n"
-        "🚧 What's blocked and needs a decision\n\n"
-        "Be direct. No fluff. Telegram format — short lines, no walls of text."
+    await process_message(update, context, BRIEF_PROMPT)
+
+
+async def cmd_kaum(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    anchor = " ".join(context.args).upper() if context.args else None
+
+    if not anchor:
+        await update.message.reply_text(
+            "Kasih anchor word-nya bro. Contoh: `/kaum WAKTU` atau `/kaum API`",
+            parse_mode="Markdown",
+        )
+        return
+
+    kaum_prompt = (
+        f"KAUM creative session. Anchor word: {anchor}\n\n"
+        f"Clone vault dulu (git clone $VAULT_GITHUB_REPO /tmp/vault), "
+        f"baca wiki/projects/kaum.md — khususnya Canon Bank dan teknik yang udah dipakai.\n\n"
+        f"Tugas:\n"
+        f"1. Generate 5 bar kandidat dengan anchor '{anchor}'. "
+        f"Satu anchor = satu image/metaphor yang di-explore dari berbagai sudut.\n"
+        f"2. Score tiap bar: Orbit (0-5) / Rhyme (0-5) / Multi (0-5). "
+        f"Composite = average. Threshold masuk canon: < 4.5.\n"
+        f"3. Flag bar mana yang layak masuk canon bank.\n"
+        f"4. Tandai teknik baru yang dipakai kalau ada.\n\n"
+        f"Format output:\n"
+        f"**[Bar]** — O:X R:X M:X → composite X.X ✅/❌\n"
+        f"Satu baris notes per bar.\n\n"
+        f"Tulis dalam bahasa yang natural — campuran EN/ID kayak biasa. "
+        f"Jaga ruh KAUM: kerentanan, spiritual, pulang."
     )
-    await process_message(update, context, brief_prompt)
+
+    await process_message(update, context, kaum_prompt)
+
+
+# ── Scheduled jobs ────────────────────────────────────────────────────────────
+
+async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
+    """Sends the morning brief automatically to Fadhil every day."""
+    if not ALLOWED_USER_ID:
+        return
+
+    chat_id = int(ALLOWED_USER_ID)
+    logger.info("Sending morning brief...")
+
+    try:
+        session_id = get_session(chat_id)
+        if not session_id:
+            session_id = new_session()
+            save_session(chat_id, session_id)
+
+        response = await asyncio.to_thread(ask_rafiq, session_id, BRIEF_PROMPT)
+        chunks = [response[i:i + 4096] for i in range(0, max(len(response), 1), 4096)]
+        for chunk in chunks:
+            try:
+                await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode="Markdown")
+            except Exception:
+                await context.bot.send_message(chat_id=chat_id, text=chunk)
+
+    except Exception as e:
+        logger.error(f"Morning brief error: {e}")
+        await context.bot.send_message(chat_id=chat_id, text="⚠️ Morning brief gagal. Coba /brief manual.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -399,10 +465,20 @@ def main():
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("brief", cmd_brief))
+    app.add_handler(CommandHandler("kaum", cmd_kaum))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+
+    # Morning brief — 7:30 AM WIB (00:30 UTC)
+    jakarta = pytz.timezone("Asia/Jakarta")
+    app.job_queue.run_daily(
+        send_morning_brief,
+        time=datetime.time(hour=7, minute=30, tzinfo=jakarta),
+        name="morning_brief",
+    )
+    logger.info("Morning brief scheduled at 07:30 WIB daily.")
 
     logger.info("RafiqSr bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
