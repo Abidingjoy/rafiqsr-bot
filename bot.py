@@ -369,6 +369,27 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("No active session. Send a message to start one.")
 
 
+async def cmd_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+    brief_prompt = (
+        "Generate a CEO brief for me. "
+        "Clone the vault first (git clone $VAULT_GITHUB_REPO /tmp/vault), then read:\n"
+        "- raw/data/hablum-pipeline.csv — pipeline status\n"
+        "- wiki/projects/hablum.md — Hablum overview\n"
+        "- wiki/projects/matter-mos.md — Matter Mos overview\n"
+        "- wiki/projects/kaum.md — KAUM overview\n"
+        "- wiki/projects/cortexin.md — Cortexin overview\n\n"
+        "Format the brief like this:\n"
+        "🔴🟡🟢 status per project (one line each)\n"
+        "📋 Pipeline snapshot — who responded, who needs follow-up\n"
+        "⚡ Top 3 things I should do today\n"
+        "🚧 What's blocked and needs a decision\n\n"
+        "Be direct. No fluff. Telegram format — short lines, no walls of text."
+    )
+    await process_message(update, context, brief_prompt)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -377,6 +398,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("brief", cmd_brief))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
