@@ -1,10 +1,12 @@
 """
 RafiqSr Telegram Bot
 Bridges Telegram ↔ Claude Managed Agents
-Supports text + voice notes (transcribed via Groq Whisper)
+Supports text + voice notes (transcribed via Groq Whisper) + images + PDFs
 """
 import asyncio
+import base64
 import logging
+import mimetypes
 import os
 import sqlite3
 import tempfile
@@ -110,16 +112,22 @@ def transcribe_audio(file_path: str) -> str:
 
 # ── Core agent call (sync — runs in thread) ───────────────────────────────────
 
-def ask_rafiq(session_id: str, text: str) -> str:
+def ask_rafiq(session_id: str, text: str, extra_content: list | None = None) -> str:
     parts = []
     tools_used = []
+
+    content = []
+    if extra_content:
+        content.extend(extra_content)
+    if text:
+        content.append({"type": "text", "text": text})
 
     with client.beta.sessions.events.stream(session_id) as stream:
         client.beta.sessions.events.send(
             session_id,
             events=[{
                 "type": "user.message",
-                "content": [{"type": "text", "text": text}],
+                "content": content,
             }],
         )
 
@@ -153,7 +161,7 @@ async def keep_typing(chat_id: int, bot, stop_event: asyncio.Event):
 
 # ── Shared: process text through Rafiq ───────────────────────────────────────
 
-async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str):
+async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, extra_content: list | None = None):
     chat_id = update.effective_chat.id
 
     stop_typing = asyncio.Event()
@@ -168,13 +176,13 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             save_session(chat_id, session_id)
 
         try:
-            response = await asyncio.to_thread(ask_rafiq, session_id, text)
+            response = await asyncio.to_thread(ask_rafiq, session_id, text, extra_content)
         except Exception as e:
             logger.warning(f"Session error ({session_id}): {e} — creating new session")
             clear_session(chat_id)
             session_id = new_session()
             save_session(chat_id, session_id)
-            response = await asyncio.to_thread(ask_rafiq, session_id, text)
+            response = await asyncio.to_thread(ask_rafiq, session_id, text, extra_content)
 
     finally:
         stop_typing.set()
@@ -186,6 +194,20 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             await update.message.reply_text(chunk, parse_mode="Markdown")
         except Exception:
             await update.message.reply_text(chunk)
+
+
+# ── File helpers ─────────────────────────────────────────────────────────────
+
+async def download_to_base64(file) -> tuple[str, str]:
+    """Download a Telegram file and return (base64_data, mime_type)."""
+    with tempfile.NamedTemporaryFile(delete=False) as tmp:
+        tmp_path = tmp.name
+    await file.download_to_drive(tmp_path)
+    mime_type = mimetypes.guess_type(file.file_path or "")[0] or "application/octet-stream"
+    with open(tmp_path, "rb") as f:
+        data = base64.standard_b64encode(f.read()).decode("utf-8")
+    os.unlink(tmp_path)
+    return data, mime_type
 
 
 # ── Telegram handlers ─────────────────────────────────────────────────────────
@@ -237,6 +259,90 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         os.unlink(tmp_path)
 
 
+async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    try:
+        # Get highest-res photo
+        photo = update.message.photo[-1]
+        file = await context.bot.get_file(photo.file_id)
+        data, _ = await download_to_base64(file)
+
+        caption = update.message.caption or "Ini gambar apa / maksudnya apa?"
+
+        extra_content = [{
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": data,
+            },
+        }]
+        await process_message(update, context, caption, extra_content)
+
+    except Exception as e:
+        logger.error(f"Image handling error: {e}")
+        await update.message.reply_text("Gagal proses gambar. Coba lagi.")
+
+
+async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    chat_id = update.effective_chat.id
+    doc = update.message.document
+
+    # Only handle PDFs and common image types
+    supported_mime = {
+        "application/pdf",
+        "image/jpeg", "image/png", "image/gif", "image/webp",
+    }
+    if doc.mime_type not in supported_mime:
+        await update.message.reply_text(
+            f"Format `{doc.mime_type}` belum didukung. Kirim PDF atau gambar.",
+            parse_mode="Markdown",
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        data, mime_type = await download_to_base64(file)
+        mime_type = doc.mime_type  # use Telegram's mime_type, more reliable
+
+        caption = update.message.caption or f"Ini file {doc.file_name}, tolong baca dan rangkum."
+
+        if mime_type == "application/pdf":
+            extra_content = [{
+                "type": "document",
+                "source": {
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": data,
+                },
+            }]
+        else:
+            extra_content = [{
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type,
+                    "data": data,
+                },
+            }]
+
+        await process_message(update, context, caption, extra_content)
+
+    except Exception as e:
+        logger.error(f"Document handling error: {e}")
+        await update.message.reply_text("Gagal proses file. Coba lagi.")
+
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -273,6 +379,8 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.PHOTO, handle_image))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     logger.info("RafiqSr bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
