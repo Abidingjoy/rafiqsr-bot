@@ -478,7 +478,7 @@ async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-def main():
+def build_rafiq_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
@@ -503,8 +503,55 @@ def main():
     else:
         logger.warning("job_queue not available — morning brief scheduler disabled. Install APScheduler.")
 
-    logger.info("RafiqSr bot starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    return app
+
+
+async def run_apps(apps: list[Application]):
+    """Initialize, start, and poll multiple PTB Applications in one process."""
+    for app in apps:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+
+    logger.info(f"{len(apps)} bot(s) running. Press Ctrl+C to stop.")
+    stop_event = asyncio.Event()
+    try:
+        await stop_event.wait()  # run until cancelled
+    finally:
+        for app in apps:
+            try:
+                await app.updater.stop()
+                await app.stop()
+                await app.shutdown()
+            except Exception as e:
+                logger.warning(f"Shutdown error: {e}")
+
+
+def main():
+    from pregnancy_bot import build_pregnancy_app
+
+    rafiq_app = build_rafiq_app()
+    apps: list[Application] = [rafiq_app]
+
+    preg_app = build_pregnancy_app()
+    if preg_app:
+        apps.append(preg_app)
+        logger.info("Running Rafiq + Pregnancy companion in one process.")
+    else:
+        logger.info("Running Rafiq only.")
+
+    # Single-bot fast path — keeps existing behavior
+    if len(apps) == 1:
+        logger.info("RafiqSr bot starting...")
+        rafiq_app.run_polling(allowed_updates=Update.ALL_TYPES)
+        return
+
+    # Multi-bot path
+    logger.info("Starting multi-bot runtime...")
+    try:
+        asyncio.run(run_apps(apps))
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Shutting down.")
 
 
 if __name__ == "__main__":
