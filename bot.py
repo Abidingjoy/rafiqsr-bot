@@ -1,7 +1,7 @@
 """
-RafiqSr Telegram Bot
+RafiqSr Telegram Bot — Full OpenClaw Replacement
 Bridges Telegram ↔ Claude Managed Agents
-Supports text + voice notes (transcribed via Groq Whisper) + images + PDFs
+Features: text, voice, images, PDFs, persistent memory, nudges, shortcuts, wiki workflows
 """
 import asyncio
 import base64
@@ -27,6 +27,8 @@ from telegram.ext import (
 )
 import pytz
 
+import memory
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -41,6 +43,29 @@ ENVIRONMENT_ID  = os.environ["ENVIRONMENT_ID"]
 VAULT_REPO      = os.environ.get("VAULT_GITHUB_REPO", "")
 ALLOWED_USER_ID = os.environ.get("ALLOWED_TELEGRAM_USER_ID", "")
 
+JAKARTA = pytz.timezone("Asia/Jakarta")
+
+# Session timeout — auto-save if idle longer than this
+SESSION_TIMEOUT = datetime.timedelta(hours=4)
+
+# ── Shortcuts (ported from Mos SHORTCUTS.md) ─────────────────────────────────
+
+SHORTCUTS = {
+    "MOE": "Clone vault (git clone $VAULT_GITHUB_REPO /tmp/vault). Read wiki/entities/moe.md + wiki/concepts/nas-line.md. Context: perfumer, NAS formula progress.",
+    "HADRA": "Clone vault. Read wiki/projects/hablum.md. Focus on Hadra architecture concept.",
+    "EXECUTION": "Clone vault. Read 99 - EXECUTION/NOW.md + wiki/status/daily.md. What's pending, what's blocked?",
+    "HABLUM B2B": "Clone vault. Read wiki/projects/hablum.md B2B section + raw/data/hablum-pipeline.csv. Pipeline status.",
+    "HABLUM": "Clone vault. Read wiki/projects/hablum.md. Full project overview.",
+    "PRICING": "Clone vault. Read wiki/projects/hablum.md pricing section. Unit economics, COGS, margins.",
+    "KAUM ALBUM": "Clone vault. Read wiki/projects/kaum.md. Album timeline, demo status, canon bank.",
+    "CORTEXIN": "Clone vault. Read wiki/projects/cortexin.md. Equity status, timeline, Pak Andrew.",
+    "MNA": "Clone vault. Read wiki/entities/pt-mna.md + wiki/decisions/mna-structure.md. Family holding.",
+    "NAS": "Clone vault. Read wiki/concepts/nas-line.md. NAS EDP development status.",
+    "MATTER MOS": "Clone vault. Read wiki/projects/matter-mos.md. Music career overview.",
+}
+
+# ── Brief prompt ─────────────────────────────────────────────────────────────
+
 BRIEF_PROMPT = (
     "Generate a CEO brief for me. "
     "Clone the vault first (git clone $VAULT_GITHUB_REPO /tmp/vault), then read:\n"
@@ -48,14 +73,18 @@ BRIEF_PROMPT = (
     "- wiki/projects/hablum.md — Hablum overview\n"
     "- wiki/projects/matter-mos.md — Matter Mos overview\n"
     "- wiki/projects/kaum.md — KAUM overview\n"
-    "- wiki/projects/cortexin.md — Cortexin overview\n\n"
+    "- wiki/projects/cortexin.md — Cortexin overview\n"
+    "- 99 - EXECUTION/hermes/ — check for today's or yesterday's Hermes report, surface top 2-3 actionable points\n\n"
     "Format the brief like this:\n"
     "🔴🟡🟢 status per project (one line each)\n"
     "📋 Pipeline snapshot — who responded, who needs follow-up\n"
     "📌 Follow-up alerts — flag venues in pipeline that haven't responded in 3+ days, "
-    "list them by name with date of last contact. If pipeline CSV has status/date columns, use those.\n"
+    "list them by name with date of last contact.\n"
     "⚡ Top 3 things I should do today\n"
     "🚧 What's blocked and needs a decision\n\n"
+    "ALSO after generating the brief: read the memory files in "
+    "90 - SYSTEM/rafiqsr-bot/memory/ (longterm.md, nudges.md, daily/ folder). "
+    "This refreshes my context. Don't output the memory — just load it silently.\n\n"
     "Be direct. No fluff. Telegram format — short lines, no walls of text."
 )
 
@@ -70,6 +99,7 @@ db.execute(
     "(chat_id INTEGER PRIMARY KEY, session_id TEXT)"
 )
 db.commit()
+memory.init_activity_table(db)
 
 
 def get_session(chat_id: int) -> str | None:
@@ -98,22 +128,25 @@ def new_session() -> str:
     )
     logger.info(f"New session: {session.id}")
 
+    # Build context: memory digest + vault info
+    digest = memory.build_context_digest()
+    context_parts = ["[SYSTEM CONTEXT]"]
+    if digest:
+        context_parts.append(f"[MEMORY CONTEXT]\n{digest}")
     if VAULT_REPO:
-        client.beta.sessions.events.send(
-            session.id,
-            events=[{
-                "type": "user.message",
-                "content": [{
-                    "type": "text",
-                    "text": (
-                        f"[SYSTEM CONTEXT] Vault repo: {VAULT_REPO}\n"
-                        f"Kalau butuh info dari vault, clone dengan:\n"
-                        f"git clone {VAULT_REPO} /tmp/vault\n"
-                        f"lalu baca wiki/ directory. Acknowledge singkat saja."
-                    ),
-                }],
-            }],
+        context_parts.append(
+            f"Vault repo: {VAULT_REPO}\n"
+            f"Clone when needed: git clone {VAULT_REPO} /tmp/vault\n"
+            f"Acknowledge briefly."
         )
+
+    client.beta.sessions.events.send(
+        session.id,
+        events=[{
+            "type": "user.message",
+            "content": [{"type": "text", "text": "\n\n".join(context_parts)}],
+        }],
+    )
 
     return session.id
 
@@ -125,7 +158,7 @@ def transcribe_audio(file_path: str) -> str:
         result = groq.audio.transcriptions.create(
             file=(os.path.basename(file_path), f),
             model="whisper-large-v3",
-            language="id",  # supports mixed ID/EN automatically
+            language="id",
         )
     return result.text.strip()
 
@@ -144,34 +177,26 @@ def ask_rafiq(session_id: str, text: str, extra_content: list | None = None) -> 
     with client.beta.sessions.events.stream(session_id) as stream:
         client.beta.sessions.events.send(
             session_id,
-            events=[{
-                "type": "user.message",
-                "content": content,
-            }],
+            events=[{"type": "user.message", "content": content}],
         )
 
         for event in stream:
             etype = getattr(event, "type", None)
             logger.info(f"[stream] event type: {etype}")
 
-            # Collect any text content from agent messages
             if etype in ("agent.message", "message"):
                 for block in getattr(event, "content", []):
                     text_val = getattr(block, "text", None)
                     if text_val:
                         parts.append(text_val)
-
-            # Also handle streaming delta events
             elif etype in ("content_block_delta", "agent.message.delta"):
                 delta = getattr(event, "delta", None)
                 if delta:
                     text_val = getattr(delta, "text", None)
                     if text_val:
                         parts.append(text_val)
-
             elif etype in ("agent.tool_use", "tool_use"):
                 logger.info(f"Tool used: {getattr(event, 'name', 'unknown')}")
-
             elif etype in ("session.status_idle", "session.idle", "done"):
                 break
 
@@ -191,7 +216,13 @@ async def keep_typing(chat_id: int, bot, stop_event: asyncio.Event):
 
 # ── Shared: process text through Rafiq ───────────────────────────────────────
 
-async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, extra_content: list | None = None):
+async def process_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    extra_content: list | None = None,
+    auto_save_memory: bool = True,
+):
     chat_id = update.effective_chat.id
 
     stop_typing = asyncio.Event()
@@ -200,7 +231,20 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
     )
 
     try:
+        # Check session timeout — auto-save old session if stale
         session_id = get_session(chat_id)
+        if session_id:
+            last_act = memory.get_last_activity(db, chat_id)
+            if last_act and (datetime.datetime.now() - last_act) > SESSION_TIMEOUT:
+                logger.info(f"Session timeout for {chat_id} — auto-saving before new session")
+                try:
+                    summary_prompt = memory.build_session_summary_prompt()
+                    await asyncio.to_thread(ask_rafiq, session_id, summary_prompt)
+                except Exception as e:
+                    logger.warning(f"Auto-save failed: {e}")
+                clear_session(chat_id)
+                session_id = None
+
         if not session_id:
             session_id = new_session()
             save_session(chat_id, session_id)
@@ -221,11 +265,29 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
                 except Exception as e2:
                     response = f"⚠️ Error: {e2}"
 
+        # Track activity
+        memory.log_activity(db, chat_id)
+
+        # Parse and save [MEMORY] tags
+        if auto_save_memory and response:
+            tags = memory.parse_memory_tags(response)
+            if tags:
+                logger.info(f"[memory] Extracted {len(tags)} memory tags: {tags}")
+                try:
+                    save_prompt = memory.build_memory_save_prompt(tags)
+                    await asyncio.to_thread(ask_rafiq, session_id, save_prompt)
+                except Exception as e:
+                    logger.warning(f"Memory save failed: {e}")
+
+            # Strip tags from display
+            response = memory.strip_memory_tags(response)
+
     finally:
         stop_typing.set()
         typing_task.cancel()
 
-    chunks = [response[i : i + 4096] for i in range(0, max(len(response), 1), 4096)]
+    # Send response (chunked for Telegram 4096 limit)
+    chunks = [response[i:i + 4096] for i in range(0, max(len(response), 1), 4096)]
     for chunk in chunks:
         try:
             await update.message.reply_text(chunk, parse_mode="Markdown")
@@ -233,10 +295,20 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
             await update.message.reply_text(chunk)
 
 
+# ── Shortcut detection ───────────────────────────────────────────────────────
+
+def detect_shortcut(text: str) -> str | None:
+    """Check if message triggers a shortcut. Returns augmented text or None."""
+    upper = text.upper().strip()
+    for key, instruction in SHORTCUTS.items():
+        if upper.startswith(key):
+            return f"[SHORTCUT: {key}] {instruction}\n\nUser says: {text}"
+    return None
+
+
 # ── File helpers ─────────────────────────────────────────────────────────────
 
 async def download_to_base64(file) -> tuple[str, str]:
-    """Download a Telegram file and return (base64_data, mime_type)."""
     with tempfile.NamedTemporaryFile(delete=False) as tmp:
         tmp_path = tmp.name
     await file.download_to_drive(tmp_path)
@@ -258,7 +330,15 @@ def is_allowed(update: Update) -> bool:
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
-    await process_message(update, context, update.message.text)
+    text = update.message.text
+
+    # Check for shortcut trigger
+    augmented = detect_shortcut(text)
+    if augmented:
+        logger.info(f"[shortcut] Triggered for: {text[:50]}")
+        await process_message(update, context, augmented)
+    else:
+        await process_message(update, context, text)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -268,7 +348,6 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
-    # Download voice note
     voice = update.message.voice
     file = await context.bot.get_file(voice.file_id)
 
@@ -279,14 +358,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await file.download_to_drive(tmp_path)
         logger.info(f"Transcribing voice note ({voice.duration}s)...")
 
-        # Transcribe
         transcript = await asyncio.to_thread(transcribe_audio, tmp_path)
         logger.info(f"Transcript: {transcript}")
 
-        # Show transcript so Fadhil knows what was heard
         await update.message.reply_text(f"_{transcript}_", parse_mode="Markdown")
-
-        # Send to Rafiq
         await process_message(update, context, transcript)
 
     except Exception as e:
@@ -304,7 +379,6 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
 
     try:
-        # Get highest-res photo
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         data, _ = await download_to_base64(file)
@@ -313,11 +387,7 @@ async def handle_image(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         extra_content = [{
             "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": "image/jpeg",
-                "data": data,
-            },
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": data},
         }]
         await process_message(update, context, caption, extra_content)
 
@@ -333,7 +403,6 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     doc = update.message.document
 
-    # Only handle PDFs and common image types
     supported_mime = {
         "application/pdf",
         "image/jpeg", "image/png", "image/gif", "image/webp",
@@ -350,27 +419,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         file = await context.bot.get_file(doc.file_id)
         data, mime_type = await download_to_base64(file)
-        mime_type = doc.mime_type  # use Telegram's mime_type, more reliable
+        mime_type = doc.mime_type
 
         caption = update.message.caption or f"Ini file {doc.file_name}, tolong baca dan rangkum."
 
         if mime_type == "application/pdf":
             extra_content = [{
                 "type": "document",
-                "source": {
-                    "type": "base64",
-                    "media_type": "application/pdf",
-                    "data": data,
-                },
+                "source": {"type": "base64", "media_type": "application/pdf", "data": data},
             }]
         else:
             extra_content = [{
                 "type": "image",
-                "source": {
-                    "type": "base64",
-                    "media_type": mime_type,
-                    "data": data,
-                },
+                "source": {"type": "base64", "media_type": mime_type, "data": data},
             }]
 
         await process_message(update, context, caption, extra_content)
@@ -380,18 +441,49 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Gagal proses file. Coba lagi.")
 
 
+# ── Commands ─────────────────────────────────────────────────────────────────
+
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
     await update.message.reply_text(
-        "Rafiq Sr. online.\n\nKirim teks atau voice note. /reset untuk fresh session."
+        "Rafiq Sr. online. 🧠\n\n"
+        "Kirim teks, voice note, gambar, atau PDF.\n\n"
+        "Commands:\n"
+        "/brief — CEO morning brief\n"
+        "/note [text] — quick capture ke vault\n"
+        "/kaum [anchor] — KAUM creative session\n"
+        "/memory — lihat long-term memory\n"
+        "/nudge [text] — tambah reminder\n"
+        "/nudges — lihat active nudges\n"
+        "/done [text] — resolve nudge\n"
+        "/save — save session memory\n"
+        "/ingest [url] — ingest ke wiki\n"
+        "/wiki [question] — tanya dari wiki\n"
+        "/reset — fresh session\n"
+        "/status — session info"
     )
 
 
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
-    clear_session(update.effective_chat.id)
+
+    chat_id = update.effective_chat.id
+    session_id = get_session(chat_id)
+
+    # Auto-save before clearing
+    if session_id:
+        await update.message.reply_text("Saving session memory...")
+        try:
+            summary_prompt = memory.build_session_summary_prompt()
+            response = await asyncio.to_thread(ask_rafiq, session_id, summary_prompt)
+            if response and response != "...":
+                logger.info(f"[reset] Session saved: {response[:100]}")
+        except Exception as e:
+            logger.warning(f"Session save on reset failed: {e}")
+
+    clear_session(chat_id)
     await update.message.reply_text("Session cleared. Fresh start, bro.")
 
 
@@ -400,10 +492,19 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     chat_id = update.effective_chat.id
     session_id = get_session(chat_id)
+    last_act = memory.get_last_activity(db, chat_id)
+    digest_status = "loaded" if memory.build_context_digest() else "empty"
+
+    lines = []
     if session_id:
-        await update.message.reply_text(f"Active session: `{session_id}`", parse_mode="Markdown")
+        lines.append(f"Session: `{session_id[:20]}...`")
     else:
-        await update.message.reply_text("No active session. Send a message to start one.")
+        lines.append("No active session.")
+    lines.append(f"Memory digest: {digest_status}")
+    if last_act:
+        lines.append(f"Last activity: {last_act.strftime('%H:%M %d/%m')}")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 
 async def cmd_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -438,7 +539,133 @@ async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"4. Confirm to me it's saved. One line reply, no extra explanation.\n\n"
         f"The note: {note_text}"
     )
-    await process_message(update, context, note_prompt)
+    await process_message(update, context, note_prompt, auto_save_memory=False)
+
+
+async def cmd_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    chat_id = update.effective_chat.id
+    session_id = get_session(chat_id)
+
+    if not session_id:
+        await update.message.reply_text("No active session to save.")
+        return
+
+    await update.message.reply_text("Saving session memory...")
+    summary_prompt = memory.build_session_summary_prompt()
+    await process_message(update, context, summary_prompt, auto_save_memory=False)
+
+
+async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show long-term memory from cache — no API call."""
+    if not is_allowed(update):
+        return
+    display = memory.get_longterm_display()
+    try:
+        await update.message.reply_text(display, parse_mode="Markdown")
+    except Exception:
+        await update.message.reply_text(display)
+
+
+async def cmd_nudge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    text = " ".join(context.args) if context.args else None
+
+    if not text:
+        await update.message.reply_text(
+            "Apa yang perlu di-nudge? Contoh: `/nudge follow up Moe soal formula`",
+            parse_mode="Markdown",
+        )
+        return
+
+    prompt = memory.build_nudge_add_prompt(text)
+    await process_message(update, context, prompt, auto_save_memory=False)
+
+
+async def cmd_nudges(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show active nudges from cache — no API call."""
+    if not is_allowed(update):
+        return
+    display = memory.get_active_nudges_display()
+    await update.message.reply_text(display)
+
+
+async def cmd_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    text = " ".join(context.args) if context.args else None
+
+    if not text:
+        await update.message.reply_text(
+            "Nudge mana yang done? Contoh: `/done follow up Moe`",
+            parse_mode="Markdown",
+        )
+        return
+
+    prompt = memory.build_nudge_done_prompt(text)
+    await process_message(update, context, prompt, auto_save_memory=False)
+
+
+async def cmd_ingest(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    source = " ".join(context.args) if context.args else None
+
+    if not source:
+        await update.message.reply_text(
+            "Kasih URL atau teks yang mau di-ingest.\n"
+            "Contoh: `/ingest https://example.com/article`",
+            parse_mode="Markdown",
+        )
+        return
+
+    ingest_prompt = (
+        f"Ingest this source into the vault wiki. Steps:\n"
+        f"1. Clone vault: git clone $VAULT_GITHUB_REPO /tmp/vault\n"
+        f"2. Read/fetch the source: {source}\n"
+        f"3. Extract key information (facts, claims, decisions, people, dates, numbers)\n"
+        f"4. Read wiki/index.md to identify which existing pages to update\n"
+        f"5. Update relevant wiki pages — add info, flag contradictions with > [!warning] callout\n"
+        f"6. Create new pages if needed (proper frontmatter: title, type, sources, related, created, updated, confidence)\n"
+        f"7. Update wiki/index.md with any new pages\n"
+        f"8. Append entry to wiki/log.md: timestamp, source, pages touched\n"
+        f"9. git add wiki/ && git commit -m 'wiki: ingest [source]' && git push\n"
+        f"10. Confirm which pages were created/updated.\n\n"
+        f"Source: {source}"
+    )
+    await process_message(update, context, ingest_prompt, auto_save_memory=False)
+
+
+async def cmd_wiki(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    question = " ".join(context.args) if context.args else None
+
+    if not question:
+        await update.message.reply_text(
+            "Tanya apa? Contoh: `/wiki berapa margin Hablum reed diffuser?`",
+            parse_mode="Markdown",
+        )
+        return
+
+    wiki_prompt = (
+        f"Answer this question using the vault wiki. Steps:\n"
+        f"1. Clone vault: git clone $VAULT_GITHUB_REPO /tmp/vault\n"
+        f"2. Read wiki/index.md to find relevant pages\n"
+        f"3. Read those pages + follow related: links if needed\n"
+        f"4. Synthesize a clear answer with citations (which wiki page says what)\n"
+        f"5. If the answer reveals a new insight worth keeping, mention it — "
+        f"I'll tell you if I want it filed as a wiki page.\n\n"
+        f"Question: {question}"
+    )
+    await process_message(update, context, wiki_prompt)
 
 
 async def cmd_kaum(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -478,7 +705,7 @@ async def cmd_kaum(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── Scheduled jobs ────────────────────────────────────────────────────────────
 
 async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
-    """Sends the morning brief automatically to Fadhil every day."""
+    """Sends the morning brief automatically + refreshes memory digest."""
     if not ALLOWED_USER_ID:
         return
 
@@ -486,7 +713,6 @@ async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Sending morning brief...")
 
     try:
-        # Always use a fresh dedicated session for the brief
         brief_session = new_session()
         logger.info(f"Morning brief session: {brief_session}")
 
@@ -496,6 +722,9 @@ async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
             logger.warning("Morning brief returned empty — skipping send.")
             return
 
+        # Strip memory tags if any
+        response = memory.strip_memory_tags(response)
+
         chunks = [response[i:i + 4096] for i in range(0, len(response), 4096)]
         for chunk in chunks:
             try:
@@ -503,8 +732,76 @@ async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 await context.bot.send_message(chat_id=chat_id, text=chunk)
 
+        # Refresh memory digest — brief already cloned vault, read memory files now
+        # We ask Rafiq to cat the memory files so we can parse them
+        try:
+            mem_response = await asyncio.to_thread(
+                ask_rafiq, brief_session,
+                "[SYSTEM — READ MEMORY FILES]\n"
+                "cat /tmp/vault/90\\ -\\ SYSTEM/rafiqsr-bot/memory/longterm.md && "
+                "echo '---SEPARATOR---' && "
+                "cat /tmp/vault/90\\ -\\ SYSTEM/rafiqsr-bot/memory/nudges.md && "
+                "echo '---SEPARATOR---' && "
+                "ls /tmp/vault/90\\ -\\ SYSTEM/rafiqsr-bot/memory/daily/ 2>/dev/null | tail -1 | "
+                "xargs -I {} cat '/tmp/vault/90 - SYSTEM/rafiqsr-bot/memory/daily/{}'\n"
+                "Output the raw file contents. Nothing else."
+            )
+            # Parse sections from response and build a fresh digest
+            if mem_response and "---SEPARATOR---" in mem_response:
+                sections = mem_response.split("---SEPARATOR---")
+                new_digest_parts = []
+                if len(sections) >= 1 and sections[0].strip():
+                    memory._longterm_cache = sections[0].strip()[:4000]
+                    new_digest_parts.append(f"## Long-term Memory\n{memory._longterm_cache}")
+                if len(sections) >= 2:
+                    raw_nudges = sections[1].strip()
+                    active = [l.strip() for l in raw_nudges.split("\n") if l.strip().startswith("- [ ]")]
+                    memory._nudges_cache = "\n".join(active) if active else "(none)"
+                    if active:
+                        new_digest_parts.append(f"## Active Nudges\n{memory._nudges_cache}")
+                if len(sections) >= 3 and sections[2].strip():
+                    new_digest_parts.append(f"## Yesterday\n{sections[2].strip()[:2000]}")
+                if new_digest_parts:
+                    memory._digest_cache = "\n\n".join(new_digest_parts)
+                    memory._last_refresh = datetime.datetime.now()
+                    logger.info(f"[memory] Digest refreshed from morning brief: {len(memory._digest_cache)} chars")
+        except Exception as e:
+            logger.warning(f"Memory digest refresh failed: {e}")
+
     except Exception as e:
         logger.error(f"Morning brief error: {e}")
+
+
+async def send_afternoon_checkin(context: ContextTypes.DEFAULT_TYPE):
+    """Afternoon proactive check-in — only if no activity today."""
+    if not ALLOWED_USER_ID:
+        return
+
+    # Skip if user already chatted today
+    if memory.had_activity_today(db):
+        logger.info("[checkin] User active today — skipping afternoon check-in.")
+        return
+
+    chat_id = int(ALLOWED_USER_ID)
+    logger.info("Sending afternoon check-in...")
+
+    # Build a simple nudge-based message
+    nudge_display = memory.get_active_nudges_display()
+    if "(none)" in nudge_display.lower() or "no active" in nudge_display.lower():
+        msg = "Yo bro, quiet day. Ada yang bisa gue bantu?"
+    else:
+        # Pick first nudge
+        lines = [l for l in nudge_display.split("\n") if l.strip().startswith("- [ ]")]
+        if lines:
+            first_nudge = lines[0].replace("- [ ] ", "").strip()
+            msg = f"Yo bro, reminder: {first_nudge}\n\nAda progress? Atau mau gue bantu yang lain?"
+        else:
+            msg = "Yo bro, quiet day. Ada yang bisa gue bantu?"
+
+    try:
+        await context.bot.send_message(chat_id=chat_id, text=msg)
+    except Exception as e:
+        logger.error(f"Afternoon check-in error: {e}")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -512,28 +809,46 @@ async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
 def build_rafiq_app() -> Application:
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # Commands
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("brief", cmd_brief))
     app.add_handler(CommandHandler("note", cmd_note))
+    app.add_handler(CommandHandler("save", cmd_save))
+    app.add_handler(CommandHandler("memory", cmd_memory))
+    app.add_handler(CommandHandler("nudge", cmd_nudge))
+    app.add_handler(CommandHandler("nudges", cmd_nudges))
+    app.add_handler(CommandHandler("done", cmd_done))
+    app.add_handler(CommandHandler("ingest", cmd_ingest))
+    app.add_handler(CommandHandler("wiki", cmd_wiki))
     app.add_handler(CommandHandler("kaum", cmd_kaum))
+
+    # Message handlers
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # Morning brief — 7:30 AM WIB
+    # Scheduled jobs
     if app.job_queue:
-        jakarta = pytz.timezone("Asia/Jakarta")
+        # Morning brief — 7:30 AM WIB
         app.job_queue.run_daily(
             send_morning_brief,
-            time=datetime.time(hour=7, minute=30, tzinfo=jakarta),
+            time=datetime.time(hour=7, minute=30, tzinfo=JAKARTA),
             name="morning_brief",
         )
         logger.info("Morning brief scheduled at 07:30 WIB daily.")
+
+        # Afternoon check-in — 14:00 WIB
+        app.job_queue.run_daily(
+            send_afternoon_checkin,
+            time=datetime.time(hour=14, minute=0, tzinfo=JAKARTA),
+            name="afternoon_checkin",
+        )
+        logger.info("Afternoon check-in scheduled at 14:00 WIB daily.")
     else:
-        logger.warning("job_queue not available — morning brief scheduler disabled. Install APScheduler.")
+        logger.warning("job_queue not available — scheduled jobs disabled. Install APScheduler.")
 
     return app
 
@@ -547,7 +862,7 @@ async def run_apps(apps: list[Application]):
 
     logger.info(f"{len(apps)} bot(s) running. Press Ctrl+C to stop.")
     try:
-        await asyncio.Event().wait()  # run until cancelled (SIGTERM/KeyboardInterrupt)
+        await asyncio.Event().wait()
     except asyncio.CancelledError:
         pass
     finally:
@@ -573,13 +888,11 @@ def main():
     else:
         logger.info("Running Rafiq only.")
 
-    # Single-bot fast path — keeps existing behavior
     if len(apps) == 1:
         logger.info("RafiqSr bot starting...")
         rafiq_app.run_polling(allowed_updates=Update.ALL_TYPES)
         return
 
-    # Multi-bot path
     logger.info("Starting multi-bot runtime...")
     try:
         asyncio.run(run_apps(apps))
