@@ -132,7 +132,6 @@ def transcribe_audio(file_path: str) -> str:
 
 def ask_rafiq(session_id: str, text: str, extra_content: list | None = None) -> str:
     parts = []
-    tools_used = []
 
     content = []
     if extra_content:
@@ -151,21 +150,32 @@ def ask_rafiq(session_id: str, text: str, extra_content: list | None = None) -> 
 
         for event in stream:
             etype = getattr(event, "type", None)
+            logger.info(f"[stream] event type: {etype}")
 
-            if etype == "agent.message":
-                for block in event.content:
-                    if hasattr(block, "text") and block.text:
-                        parts.append(block.text)
+            # Collect any text content from agent messages
+            if etype in ("agent.message", "message"):
+                for block in getattr(event, "content", []):
+                    text_val = getattr(block, "text", None)
+                    if text_val:
+                        parts.append(text_val)
 
-            elif etype == "agent.tool_use":
-                name = getattr(event, "name", "tool")
-                tools_used.append(name)
-                logger.info(f"Tool used: {name}")
+            # Also handle streaming delta events
+            elif etype in ("content_block_delta", "agent.message.delta"):
+                delta = getattr(event, "delta", None)
+                if delta:
+                    text_val = getattr(delta, "text", None)
+                    if text_val:
+                        parts.append(text_val)
 
-            elif etype == "session.status_idle":
+            elif etype in ("agent.tool_use", "tool_use"):
+                logger.info(f"Tool used: {getattr(event, 'name', 'unknown')}")
+
+            elif etype in ("session.status_idle", "session.idle", "done"):
                 break
 
     response = "".join(parts).strip()
+    if not response:
+        logger.warning(f"[ask_rafiq] Empty response for session {session_id}")
     return response or "..."
 
 
@@ -438,13 +448,17 @@ async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
     logger.info("Sending morning brief...")
 
     try:
-        session_id = get_session(chat_id)
-        if not session_id:
-            session_id = new_session()
-            save_session(chat_id, session_id)
+        # Always use a fresh dedicated session for the brief
+        brief_session = new_session()
+        logger.info(f"Morning brief session: {brief_session}")
 
-        response = await asyncio.to_thread(ask_rafiq, session_id, BRIEF_PROMPT)
-        chunks = [response[i:i + 4096] for i in range(0, max(len(response), 1), 4096)]
+        response = await asyncio.to_thread(ask_rafiq, brief_session, BRIEF_PROMPT)
+
+        if not response or response == "...":
+            logger.warning("Morning brief returned empty — skipping send.")
+            return
+
+        chunks = [response[i:i + 4096] for i in range(0, len(response), 4096)]
         for chunk in chunks:
             try:
                 await context.bot.send_message(chat_id=chat_id, text=chunk, parse_mode="Markdown")
@@ -453,7 +467,6 @@ async def send_morning_brief(context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.error(f"Morning brief error: {e}")
-        await context.bot.send_message(chat_id=chat_id, text="⚠️ Morning brief gagal. Coba /brief manual.")
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -471,14 +484,17 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # Morning brief — 7:30 AM WIB (00:30 UTC)
-    jakarta = pytz.timezone("Asia/Jakarta")
-    app.job_queue.run_daily(
-        send_morning_brief,
-        time=datetime.time(hour=7, minute=30, tzinfo=jakarta),
-        name="morning_brief",
-    )
-    logger.info("Morning brief scheduled at 07:30 WIB daily.")
+    # Morning brief — 7:30 AM WIB
+    if app.job_queue:
+        jakarta = pytz.timezone("Asia/Jakarta")
+        app.job_queue.run_daily(
+            send_morning_brief,
+            time=datetime.time(hour=7, minute=30, tzinfo=jakarta),
+            name="morning_brief",
+        )
+        logger.info("Morning brief scheduled at 07:30 WIB daily.")
+    else:
+        logger.warning("job_queue not available — morning brief scheduler disabled. Install APScheduler.")
 
     logger.info("RafiqSr bot starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
