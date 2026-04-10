@@ -186,9 +186,31 @@ def build_pregnancy_app() -> Application | None:
         db.execute("DELETE FROM sessions WHERE chat_id = ?", (chat_id,))
         db.commit()
 
+    vault_repo = os.environ.get("VAULT_GITHUB_REPO", "")
+
     def new_sess() -> str:
         s = _client.beta.sessions.create(agent=agent_id, environment_id=env_id)
         logger.info(f"[preg] New session: {s.id}")
+
+        if vault_repo:
+            _client.beta.sessions.events.send(
+                s.id,
+                events=[{
+                    "type": "user.message",
+                    "content": [{
+                        "type": "text",
+                        "text": (
+                            f"[SYSTEM CONTEXT] Vault repo: {vault_repo}\n"
+                            f"Load your memory journal:\n"
+                            f"git clone {vault_repo} /tmp/vault\n"
+                            f"cat /tmp/vault/raw/conversations/ruh-journal.md\n"
+                            f"Read it silently and use it as context. "
+                            f"Then wait for the user — don't say anything yet."
+                        ),
+                    }],
+                }],
+            )
+
         return s.id
 
     def is_allowed(update: Update) -> bool:
