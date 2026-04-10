@@ -206,11 +206,18 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, te
         try:
             response = await asyncio.to_thread(ask_rafiq, session_id, text, extra_content)
         except Exception as e:
-            logger.warning(f"Session error ({session_id}): {e} — creating new session")
-            clear_session(chat_id)
-            session_id = new_session()
-            save_session(chat_id, session_id)
-            response = await asyncio.to_thread(ask_rafiq, session_id, text, extra_content)
+            err = str(e).lower()
+            if "rate limit" in err or "429" in err or "rate_limit" in err:
+                response = "⚠️ Kena rate limit Anthropic. Tunggu sebentar terus coba lagi."
+            else:
+                logger.warning(f"Session error ({session_id}): {e} — creating new session")
+                clear_session(chat_id)
+                session_id = new_session()
+                save_session(chat_id, session_id)
+                try:
+                    response = await asyncio.to_thread(ask_rafiq, session_id, text, extra_content)
+                except Exception as e2:
+                    response = f"⚠️ Error: {e2}"
 
     finally:
         stop_typing.set()
