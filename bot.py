@@ -52,6 +52,8 @@ BRIEF_PROMPT = (
     "Format the brief like this:\n"
     "🔴🟡🟢 status per project (one line each)\n"
     "📋 Pipeline snapshot — who responded, who needs follow-up\n"
+    "📌 Follow-up alerts — flag venues in pipeline that haven't responded in 3+ days, "
+    "list them by name with date of last contact. If pipeline CSV has status/date columns, use those.\n"
     "⚡ Top 3 things I should do today\n"
     "🚧 What's blocked and needs a decision\n\n"
     "Be direct. No fluff. Telegram format — short lines, no walls of text."
@@ -410,6 +412,35 @@ async def cmd_brief(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_message(update, context, BRIEF_PROMPT)
 
 
+async def cmd_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_allowed(update):
+        return
+
+    note_text = " ".join(context.args) if context.args else None
+
+    if not note_text:
+        await update.message.reply_text(
+            "Tulis note-nya. Contoh: `/note ide baru buat NAS naming`",
+            parse_mode="Markdown",
+        )
+        return
+
+    today = datetime.date.today().strftime("%Y-%m-%d")
+    note_prompt = (
+        f"Save this quick note to the vault. Steps:\n"
+        f"1. cd /tmp/vault (or git clone $VAULT_GITHUB_REPO /tmp/vault if not cloned yet)\n"
+        f"2. Create file: 00 - INBOX/{today}-note.md\n"
+        f"   If the file already exists, APPEND to it (don't overwrite previous notes from today).\n"
+        f"   Format:\n"
+        f"   ## [HH:MM] Quick note\n"
+        f"   {note_text}\n\n"
+        f"3. git add, commit, push.\n"
+        f"4. Confirm to me it's saved. One line reply, no extra explanation.\n\n"
+        f"The note: {note_text}"
+    )
+    await process_message(update, context, note_prompt)
+
+
 async def cmd_kaum(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_allowed(update):
         return
@@ -485,6 +516,7 @@ def build_rafiq_app() -> Application:
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("brief", cmd_brief))
+    app.add_handler(CommandHandler("note", cmd_note))
     app.add_handler(CommandHandler("kaum", cmd_kaum))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
