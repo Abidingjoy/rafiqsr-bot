@@ -514,9 +514,10 @@ async def run_apps(apps: list[Application]):
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
 
     logger.info(f"{len(apps)} bot(s) running. Press Ctrl+C to stop.")
-    stop_event = asyncio.Event()
     try:
-        await stop_event.wait()  # run until cancelled
+        await asyncio.Event().wait()  # run until cancelled (SIGTERM/KeyboardInterrupt)
+    except asyncio.CancelledError:
+        pass
     finally:
         for app in apps:
             try:
