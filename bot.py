@@ -178,37 +178,48 @@ def ask_rafiq(session_id: str, text: str, extra_content: list | None = None) -> 
     if text:
         content.append({"type": "text", "text": text})
 
-    with client.beta.sessions.events.stream(session_id) as stream:
-        client.beta.sessions.events.send(
-            session_id,
-            events=[{"type": "user.message", "content": content}],
-        )
+    def _stream_once(sid: str, msg_content: list) -> str:
+        collected = []
+        with client.beta.sessions.events.stream(sid) as stream:
+            client.beta.sessions.events.send(
+                sid,
+                events=[{"type": "user.message", "content": msg_content}],
+            )
+            for event in stream:
+                etype = getattr(event, "type", None)
+                logger.info(f"[stream] event type: {etype}")
 
-        for event in stream:
-            etype = getattr(event, "type", None)
-            logger.info(f"[stream] event type: {etype}")
+                if etype in ("session.status_idle", "session.idle", "done"):
+                    break
+                elif etype in ("agent.tool_use", "tool_use"):
+                    logger.info(f"Tool used: {getattr(event, 'name', 'unknown')}")
+                else:
+                    for block in getattr(event, "content", []) or []:
+                        t = getattr(block, "text", None)
+                        if t:
+                            collected.append(t)
+                    delta = getattr(event, "delta", None)
+                    if delta:
+                        t = getattr(delta, "text", None)
+                        if t:
+                            collected.append(t)
+        return "".join(collected).strip()
 
-            if etype in ("session.status_idle", "session.idle", "done"):
-                break
-            elif etype in ("agent.tool_use", "tool_use"):
-                logger.info(f"Tool used: {getattr(event, 'name', 'unknown')}")
-            else:
-                # Try to extract text from content blocks (agent.message, message, etc.)
-                for block in getattr(event, "content", []) or []:
-                    text_val = getattr(block, "text", None)
-                    if text_val:
-                        parts.append(text_val)
-                # Try to extract text from deltas (content_block_delta, agent.message.delta, etc.)
-                delta = getattr(event, "delta", None)
-                if delta:
-                    text_val = getattr(delta, "text", None)
-                    if text_val:
-                        parts.append(text_val)
+    response = _stream_once(session_id, content)
 
-    response = "".join(parts).strip()
+    # Retry once if empty — sometimes the agent is mid-tool-use and needs a nudge
     if not response:
-        logger.warning(f"[ask_rafiq] Empty response for session {session_id}")
-    return response or "..."
+        logger.warning(f"[ask_rafiq] Empty response — retrying once (session {session_id})")
+        try:
+            response = _stream_once(session_id, [{"type": "text", "text": "(please respond)"}])
+        except Exception as e:
+            logger.warning(f"[ask_rafiq] Retry failed: {e}")
+
+    if not response:
+        logger.warning(f"[ask_rafiq] Still empty after retry — giving up")
+        return "Gue ga dapet response dari server. Coba kirim ulang pesan lo."
+
+    return response
 
 
 # ── Typing indicator ──────────────────────────────────────────────────────────
