@@ -92,8 +92,12 @@ client = Anthropic()
 groq   = Groq(api_key=os.environ["GROQ_API_KEY"])
 
 # ── Session store (SQLite) ────────────────────────────────────────────────────
+# DB_PATH: set to /data/sessions.db on Railway (with Volume mounted at /data)
+# Falls back to local sessions.db for dev
 
-db = sqlite3.connect("sessions.db", check_same_thread=False)
+_db_path = os.environ.get("DB_PATH", "sessions.db")
+os.makedirs(os.path.dirname(_db_path), exist_ok=True) if os.path.dirname(_db_path) else None
+db = sqlite3.connect(_db_path, check_same_thread=False)
 db.execute(
     "CREATE TABLE IF NOT EXISTS sessions "
     "(chat_id INTEGER PRIMARY KEY, session_id TEXT)"
@@ -184,21 +188,22 @@ def ask_rafiq(session_id: str, text: str, extra_content: list | None = None) -> 
             etype = getattr(event, "type", None)
             logger.info(f"[stream] event type: {etype}")
 
-            if etype in ("agent.message", "message"):
-                for block in getattr(event, "content", []):
+            if etype in ("session.status_idle", "session.idle", "done"):
+                break
+            elif etype in ("agent.tool_use", "tool_use"):
+                logger.info(f"Tool used: {getattr(event, 'name', 'unknown')}")
+            else:
+                # Try to extract text from content blocks (agent.message, message, etc.)
+                for block in getattr(event, "content", []) or []:
                     text_val = getattr(block, "text", None)
                     if text_val:
                         parts.append(text_val)
-            elif etype in ("content_block_delta", "agent.message.delta"):
+                # Try to extract text from deltas (content_block_delta, agent.message.delta, etc.)
                 delta = getattr(event, "delta", None)
                 if delta:
                     text_val = getattr(delta, "text", None)
                     if text_val:
                         parts.append(text_val)
-            elif etype in ("agent.tool_use", "tool_use"):
-                logger.info(f"Tool used: {getattr(event, 'name', 'unknown')}")
-            elif etype in ("session.status_idle", "session.idle", "done"):
-                break
 
     response = "".join(parts).strip()
     if not response:
