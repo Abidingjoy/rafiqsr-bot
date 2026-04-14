@@ -68,14 +68,14 @@ SHORTCUTS = {
 
 BRIEF_PROMPT = (
     "Generate a CEO brief for me. "
-    "Clone the vault first (git clone $VAULT_GITHUB_REPO /tmp/vault), then read:\n"
+    "Clone the vault first (git clone $VAULT_GITHUB_REPO /tmp/vault), then read the files below SILENTLY — do not output raw file contents, shell output, or git output.\n"
     "- raw/data/hablum-pipeline.csv — pipeline status\n"
     "- wiki/projects/hablum.md — Hablum overview\n"
     "- wiki/projects/matter-mos.md — Matter Mos overview\n"
     "- wiki/projects/kaum.md — KAUM overview\n"
     "- wiki/projects/cortexin.md — Cortexin overview\n"
     "- 99 - EXECUTION/hermes/ — check for today's or yesterday's Hermes report, surface top 2-3 actionable points\n\n"
-    "Format the brief like this:\n"
+    "Output ONLY the brief in this format:\n"
     "🔴🟡🟢 status per project (one line each)\n"
     "📋 Pipeline snapshot — who responded, who needs follow-up\n"
     "📌 Follow-up alerts — flag venues in pipeline that haven't responded in 3+ days, "
@@ -83,9 +83,10 @@ BRIEF_PROMPT = (
     "⚡ Top 3 things I should do today\n"
     "🚧 What's blocked and needs a decision\n\n"
     "ALSO after generating the brief: read the memory files in "
-    "90 - SYSTEM/rafiqsr-bot/memory/ (longterm.md, nudges.md, daily/ folder). "
-    "This refreshes my context. Don't output the memory — just load it silently.\n\n"
-    "Be direct. No fluff. Telegram format — short lines, no walls of text."
+    "90 - SYSTEM/rafiqsr-bot/memory/ (longterm.md, nudges.md, daily/ folder) SILENTLY. "
+    "Do not output the memory contents — just load context.\n\n"
+    "Be direct. No fluff. Telegram format — short lines, no walls of text. "
+    "Do NOT output any raw file contents, git clone progress, ls output, or grep results."
 )
 
 client = Anthropic()
@@ -134,23 +135,33 @@ def new_session() -> str:
 
     # Build context: memory digest + vault info
     digest = memory.build_context_digest()
-    context_parts = ["[SYSTEM CONTEXT]"]
+    context_parts = ["[SYSTEM CONTEXT — do not repeat this back to the user]"]
     if digest:
         context_parts.append(f"[MEMORY CONTEXT]\n{digest}")
     if VAULT_REPO:
         context_parts.append(
             f"Vault repo: {VAULT_REPO}\n"
             f"Clone when needed: git clone {VAULT_REPO} /tmp/vault\n"
-            f"Acknowledge briefly."
+            f"IMPORTANT: Never output raw tool results, file contents, git output, or shell output to the user. Process silently.\n"
+            f"Acknowledge with ONLY two words: 'Ready, bro.' — nothing else."
         )
 
-    client.beta.sessions.events.send(
-        session.id,
-        events=[{
-            "type": "user.message",
-            "content": [{"type": "text", "text": "\n\n".join(context_parts)}],
-        }],
-    )
+    # Send context and consume the init response silently (don't forward to user)
+    try:
+        with client.beta.sessions.events.stream(session.id) as stream:
+            client.beta.sessions.events.send(
+                session.id,
+                events=[{
+                    "type": "user.message",
+                    "content": [{"type": "text", "text": "\n\n".join(context_parts)}],
+                }],
+            )
+            for event in stream:
+                etype = getattr(event, "type", None)
+                if etype in ("session.status_idle", "session.idle", "done"):
+                    break
+    except Exception as e:
+        logger.warning(f"[new_session] Init stream error (non-fatal): {e}")
 
     return session.id
 
