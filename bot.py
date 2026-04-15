@@ -200,11 +200,32 @@ def ask_rafiq(session_id: str, text: str, extra_content: list | None = None) -> 
                 etype = getattr(event, "type", None)
                 logger.info(f"[stream] event type: {etype}")
 
+                # Terminal events
                 if etype in ("session.status_idle", "session.idle", "done"):
                     break
-                elif etype in ("agent.tool_use", "tool_use"):
-                    logger.info(f"Tool used: {getattr(event, 'name', 'unknown')}")
+                # Skip non-agent events — don't capture user echoes or tool I/O
+                elif etype in (
+                    "user.message", "tool_use", "agent.tool_use",
+                    "tool_result", "agent.tool_result",
+                    "input_json_delta",
+                ):
+                    if etype in ("agent.tool_use", "tool_use"):
+                        logger.info(f"Tool used: {getattr(event, 'name', 'unknown')}")
+                # Capture only agent text output
+                elif etype in ("agent.message", "message"):
+                    for block in getattr(event, "content", []) or []:
+                        t = getattr(block, "text", None)
+                        if t:
+                            collected.append(t)
+                elif etype in ("content_block_delta", "agent.message.delta", "text_delta"):
+                    delta = getattr(event, "delta", None)
+                    if delta:
+                        t = getattr(delta, "text", None)
+                        if t:
+                            collected.append(t)
                 else:
+                    # Unknown event — try to get text but log it for diagnosis
+                    logger.info(f"[stream] unknown event type: {etype} — attempting text extract")
                     for block in getattr(event, "content", []) or []:
                         t = getattr(block, "text", None)
                         if t:
@@ -857,25 +878,8 @@ def build_rafiq_app() -> Application:
     app.add_handler(MessageHandler(filters.PHOTO, handle_image))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
-    # Scheduled jobs
-    if app.job_queue:
-        # Morning brief — 7:30 AM WIB
-        app.job_queue.run_daily(
-            send_morning_brief,
-            time=datetime.time(hour=7, minute=30, tzinfo=JAKARTA),
-            name="morning_brief",
-        )
-        logger.info("Morning brief scheduled at 07:30 WIB daily.")
-
-        # Afternoon check-in — 14:00 WIB
-        app.job_queue.run_daily(
-            send_afternoon_checkin,
-            time=datetime.time(hour=14, minute=0, tzinfo=JAKARTA),
-            name="afternoon_checkin",
-        )
-        logger.info("Afternoon check-in scheduled at 14:00 WIB daily.")
-    else:
-        logger.warning("job_queue not available — scheduled jobs disabled. Install APScheduler.")
+    # Scheduled jobs disabled — auto-brief and auto-checkin dumped raw file
+    # contents to chat. Use /brief manually when needed.
 
     return app
 
